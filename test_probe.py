@@ -3,35 +3,33 @@ import sys
 import json
 import subprocess
 
-url = "https://www.youtube.com/watch?v=gCNeDWCI0vo"
-clients = [
-    "android", "android_vr", "android_creator", "android_music", "android_problabs",
-    "web", "web_embedded", "web_creator", "web_safari",
-    "mweb", "tv", "tv_embedded"
-]
+cookie_text = os.environ.get("YT_COOKIES", "").strip()
+cookie_file = "/tmp/test_cookies.txt"
+with open(cookie_file, "w", encoding="utf-8") as f:
+    f.write(cookie_text)
 
-print(f"Testing all player_clients for {url} on runner...\n")
+url = "https://www.youtube.com/watch?v=gCNeDWCI0vo"
+clients = ["web", "mweb", "android", "tv", "ios"]
+
+print(f"Testing url={url} with cookies (bytes: {len(cookie_text)}) + Deno...\n")
 
 for client in clients:
     cmd = [
         sys.executable, "-m", "yt_dlp", "--no-config", "--no-cache-dir",
-        "-J", "--skip-download", "--socket-timeout", "10",
+        "-J", "--skip-download", "--socket-timeout", "15",
+        "--cookies", cookie_file,
         "--extractor-args", f"youtube:player_client={client}",
         url
     ]
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
         code = res.returncode
         out_len = len(res.stdout or "")
-        err = (res.stderr or "").replace("\n", " ")[:150]
-        is_live = False
-        formats = 0
+        err = (res.stderr or "").replace("\n", " ")[:200]
         if code == 0 and res.stdout.strip():
             d = json.loads(res.stdout)
-            is_live = d.get("is_live")
-            formats = len(d.get("formats", []))
-            print(f"[{client:16}] SUCCESS: exit=0 formats={formats} is_live={is_live}")
+            print(f"[{client:10}] SUCCESS: exit=0 formats={len(d.get('formats', []))} is_live={d.get('is_live')} live_status={d.get('live_status')}")
         else:
-            print(f"[{client:16}] FAIL: exit={code} | {err}")
+            print(f"[{client:10}] FAIL: exit={code} | {err}")
     except Exception as e:
-        print(f"[{client:16}] ERROR: {e}")
+        print(f"[{client:10}] ERROR: {e}")
