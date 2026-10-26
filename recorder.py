@@ -51,9 +51,9 @@ USE_COOKIES = (
 
 FORMAT_SELECTOR = os.getenv(
     "FORMAT_SELECTOR",
-    "b[height<=1080][height>=480][protocol*=m3u8]/b[height<=720][protocol*=m3u8]/b[protocol*=m3u8]/b[height<=1080][height>=480]/b[height<=720]/b",
+    "bv*[height<=1080]+ba/b[height<=1080]/bv*[height<=720]+ba/b[height<=720]/bv*+ba/b",
 )
-SORT_EXPR = "res:720,fps,br"
+SORT_EXPR = "res:1080,fps,br"
 
 PRIMARY_RECHECK_SECONDS = 25
 ACTIVE_SESSION_RECHECK_SECONDS = 120
@@ -94,8 +94,8 @@ STALL_RETRY_BACKOFF_SECONDS = 4
 CLIENT_SWITCH_DELAY_SECONDS = 5
 
 # Candidate order; use the probe workflow to validate clients on your runner.
-DOWNLOAD_CLIENTS = [None, "web", "web_safari"]
-VALIDATION_CLIENTS = [None, "web"]
+DOWNLOAD_CLIENTS = ["android", None, "web"]
+VALIDATION_CLIENTS = ["android", None, "web"]
 
 SESSION_ACTIVE = threading.Event()
 DOWNLOAD_ACTIVE = threading.Event()
@@ -259,7 +259,7 @@ def install_dependencies():
 
 
 def js_runtime_args():
-    args = ["--remote-components", "ejs:github"]
+    args = []
     if command_exists("node"):
         args += ["--js-runtimes", "node"]
     elif command_exists("nodejs"):
@@ -387,8 +387,9 @@ def is_live_candidate(info):
 
 def run_ytdlp_json(url, client):
     command = [
-        sys.executable, "-m", "yt_dlp", "--no-config", "-J",
+        sys.executable, "-m", "yt_dlp", "--no-config", "--no-cache-dir", "-J",
         "--skip-download", "--no-warnings", "--ignore-no-formats-error",
+        "--socket-timeout", "15", "--retries", "1", "--extractor-retries", "1",
         "--playlist-items", "1",
     ] + JS_ARGS
 
@@ -479,72 +480,40 @@ def verify_live_id(video_id, source_kind):
         return None
 
     started = time.monotonic()
-    executor = ThreadPoolExecutor(max_workers=len(VALIDATION_CLIENTS))
-    futures = {executor.submit(validate_candidate, video_id, client): client for client in VALIDATION_CLIENTS}
-    result = None
+    for client in VALIDATION_CLIENTS:
+        candidate = validate_candidate(video_id, client)
+        if candidate:
+            global LIVE_DETECTED_EVER
+            LIVE_DETECTED_EVER = True
+            elapsed = time.monotonic() - started
+            log(f"detect_live | source={source_kind} | live id={candidate['id']} | client={client_label(client)} | match={candidate['match_reason']} | validation={elapsed:.1f}s")
+            return {"id": candidate["id"], "url": candidate["url"], "source": source_kind, "detected_client": client}
 
-    try:
-        for future in as_completed(futures, timeout=PROBE_TIMEOUT_SECONDS + 2):
-            try:
-                candidate = future.result()
-            except Exception:
-                candidate = None
-            if candidate:
-                result = candidate
-                break
-    except Exception:
-        pass
-    finally:
-        executor.shutdown(wait=False)
-
-    if result:
-        global LIVE_DETECTED_EVER
-        LIVE_DETECTED_EVER = True
-        elapsed = time.monotonic() - started
-        log(f"detect_live | source={source_kind} | live id={result['id']} | client={client_label(result['client'])} | match={result['match_reason']} | validation={elapsed:.1f}s")
-        return {"id": result["id"], "url": result["url"], "source": source_kind, "detected_client": result["client"]}
     return None
 
 
 def probe_fast():
-    executor = ThreadPoolExecutor(max_workers=3)
-    futures = {
-        executor.submit(fetch_text, CHANNEL_URL): "home",
-        executor.submit(run_ytdlp_json, LIVE_URL, None): "default_live",
-        executor.submit(run_ytdlp_json, LIVE_URL, "web_safari"): "web_live",
-    }
-    home_html = ""
-    live_infos = {}
+    info = run_ytdlp_json(LIVE_URL, "android") or run_ytdlp_json(LIVE_URL, None)
+    if not info:
+        log("probe_fast | ytdlp returned no info")
+    else:
+        video_id = info.get("id")
+        if is_live_candidate(info):
+            matched, reason = target_match(info)
+            if matched:
+                global LIVE_DETECTED_EVER
+                LIVE_DETECTED_EVER = True
+                log(f"detect_live | source=live_endpoint | live id={video_id} | client=android | match={reason}")
+                return {"id": video_id, "url": f"https://www.youtube.com/watch?v={video_id}", "source": "live_endpoint", "detected_client": "android"}
 
-    try:
-        for future in as_completed(futures, timeout=PROBE_TIMEOUT_SECONDS + 4):
-            kind = futures[future]
-            try:
-                value = future.result()
-            except Exception:
-                value = None
-            if kind == "home":
-                home_html = value or ""
-            else:
-                live_infos[kind] = value
-    except Exception:
-        pass
-    finally:
-        executor.shutdown(wait=False)
+        # If info gave a video ID (e.g. from channel tab entry where live_status is omitted), verify its watch URL directly
+        if video_id and re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+            result = verify_live_id(video_id, "live_endpoint_watch")
+            if result:
+                return result
 
-    for key, client in (("default_live", None), ("web_live", "web_safari")):
-        info = live_infos.get(key)
-        if not info or not is_live_candidate(info):
-            continue
-        matched, reason = target_match(info)
-        if not matched:
-            continue
-        video_id = info["id"]
-        LIVE_DETECTED_EVER = True
-        log(f"detect_live | source=live_endpoint | live id={video_id} | client={client} | match={reason}")
-        return {"id": video_id, "url": f"https://www.youtube.com/watch?v={video_id}", "source": "live_endpoint", "detected_client": client}
-
-
+    # Fallback to channel home page if direct live endpoint was inconclusive
+    home_html = fetch_text(CHANNEL_URL)
     for video_id in extract_live_badge_ids(home_html)[:2]:
         result = verify_live_id(video_id, "home_live_badge")
         if result:
@@ -665,7 +634,7 @@ def save_active_state(active):
 
 
 def chunk_number(path):
-    match = re.search(r"_chunk(\d+)\.ts(?:\.part)?$", os.path.basename(path))
+    match = re.search(r"_chunk(\d+)", os.path.basename(path))
     return int(match.group(1)) if match else 0
 
 
@@ -682,7 +651,14 @@ def register_recovered_chunks(active):
     known = set(registered)
     recovered = []
 
-    candidates = glob.glob(os.path.join(active["chunk_dir"], "*.ts")) + glob.glob(os.path.join(active["chunk_dir"], "*.ts.part"))
+    candidates = [
+        p for p in (
+            glob.glob(os.path.join(active["chunk_dir"], "*.ts*"))
+            + glob.glob(os.path.join(active["chunk_dir"], "*.mp4*"))
+            + glob.glob(os.path.join(active["chunk_dir"], "*.mkv*"))
+        )
+        if not is_archived_short_exit(p)
+    ]
     for path in sorted(candidates, key=chunk_number):
         if is_archived_short_exit(path):
             continue
@@ -913,8 +889,16 @@ def make_download_cmd(active, chunk_path, client):
 def current_saved_path(base_path):
     if os.path.isfile(base_path):
         return base_path
-    part_path = base_path + ".part"
-    return part_path if os.path.isfile(part_path) else None
+    for ext in (".part", ".mp4", ".ts.mp4", ".mkv", ".webm"):
+        candidate = base_path + ext
+        if os.path.isfile(candidate):
+            return candidate
+    base_no_ext = os.path.splitext(base_path)[0]
+    for ext in (".mp4", ".ts", ".mkv", ".webm"):
+        candidate = base_no_ext + ext
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 
 def finalize_download_path(base_path):
@@ -1333,8 +1317,12 @@ def main():
     if DISK_LIMIT_REACHED:
         raise SystemExit(3)
     saved_paths = [
-        path for path in glob.glob(os.path.join(OUT_DIR, "**", "*.ts"), recursive=True)
-        if os.path.getsize(path) >= MIN_SAVE_BYTES
+        path for path in (
+            glob.glob(os.path.join(OUT_DIR, "**", "*.ts"), recursive=True)
+            + glob.glob(os.path.join(OUT_DIR, "**", "*.mp4"), recursive=True)
+            + glob.glob(os.path.join(OUT_DIR, "**", "*.mkv"), recursive=True)
+        )
+        if os.path.isfile(path) and os.path.getsize(path) >= MIN_SAVE_BYTES and not path.endswith(".part")
     ]
 
     if not saved_paths:
