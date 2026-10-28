@@ -31,7 +31,7 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          - "@HarshxTashu|UCIvzNxn_8Avi35lki-idQHg"
+          - "@RepublicWorld|UCwqusr8YDwM-3mEYTDeJHzw"
 
     steps:
       - name: Checkout Repository
